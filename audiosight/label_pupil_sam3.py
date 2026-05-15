@@ -134,47 +134,100 @@ def resolve_device(arg: str) -> torch.device:
     return torch.device(arg)
 
 
-def sample_anchors_from_mask(
-    mask: np.ndarray, feat_h: int, feat_w: int, num_anchors: int, rng: np.random.Generator
-) -> np.ndarray:
-    """Resize mask to (feat_h, feat_w) and sample P anchor points inside it.
-
-    Returns shape (P, 2) in (x, y) feature-map coords. Falls back to uniform
-    sampling over the whole feature map if the resized mask is empty.
-    """
-    mask_small = cv2.resize(
-        mask.astype(np.uint8), (feat_w, feat_h), interpolation=cv2.INTER_NEAREST
-    )
-    ys, xs = np.where(mask_small > 0)
-    if len(ys) == 0:
-        xs = rng.integers(0, feat_w, num_anchors)
-        ys = rng.integers(0, feat_h, num_anchors)
-        return np.stack([xs, ys], axis=1).astype(np.int32)
-    if len(ys) >= num_anchors:
-        idx = rng.choice(len(ys), num_anchors, replace=False)
-    else:
-        idx = rng.choice(len(ys), num_anchors, replace=True)
-    return np.stack([xs[idx], ys[idx]], axis=1).astype(np.int32)
+# ---------------------------------------------------------------------------
+# S4M-faithful helpers. Vendored verbatim from cvlab-kaist/S4M (commit
+# 47e2cf6) so anchor-sampling and similarity-map computation are bit-for-bit
+# the algorithm used in the paper "S4M: Semi-Supervised Semantic Segmentation
+# via SAM Distillation" (arXiv:2504.05301).
+#
+# Sources:
+#   mask2former/modeling/criterion.py:202-225   (calc_similarity_map)
+#   modules/train_loop.py:552-575                (extract_point_gt_rand)
+#
+# Convention: point_coords are stored as (row, col) = (h, w) = (y, x),
+# matching S4M's `random_pixels_hw`. NOT (x, y).
+# ---------------------------------------------------------------------------
 
 
-def s4m_similarity_map(feat: torch.Tensor, anchors_xy: np.ndarray) -> torch.Tensor:
-    """S4M Eq.1-style: cosine sim between P anchor features and all H'W' grid features.
+def s4m_calc_similarity_map(feats: torch.Tensor, point_coords: torch.Tensor) -> torch.Tensor:
+    """Verbatim re-implementation of S4M `SetCriterion.calc_similarity_map`.
 
     Args:
-        feat: (C, H', W') feature map.
-        anchors_xy: (P, 2) int32 anchor coords (x, y) in feature-map grid.
+        feats: (N, res*res, C)
+        point_coords: (N, P, 2) with [..., 0] = row (h), [..., 1] = col (w)
+    Returns:
+        sim_map: (N, P, res*res)
+    """
+    res = int(feats.shape[1] ** 0.5)
+    point_indices = (point_coords[:, :, 0] * res + point_coords[:, :, 1]).long()  # (N, P)
+    extracted_features = torch.gather(
+        feats,
+        dim=1,
+        index=point_indices.unsqueeze(-1).expand(-1, -1, feats.shape[-1]),
+    )  # (N, P, C)
+    extracted_features_norm = extracted_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    extracted_features_normalized = extracted_features / extracted_features_norm
+    feats_norm = feats.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    feats_normalized = feats / feats_norm
+    sim_map = torch.bmm(extracted_features_normalized, feats_normalized.permute(0, 2, 1))
+    return sim_map
+
+
+def s4m_extract_point_gt_rand(
+    merged_gt_mask: torch.Tensor,
+    num_samples: int,
+    feat_res: int,
+    rng: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Adapted from S4M `extract_point_gt_rand` (modules/train_loop.py:552-575).
+
+    Samples half of `num_samples` points from inside the mask, half uniformly
+    over the whole image, then scales coordinates to the feature-map grid.
+
+    Args:
+        merged_gt_mask: (H, W) uint8/bool mask (pseudo-GT here is SAM3 top-1).
+        num_samples: P, total anchor count.
+        feat_res: target feature-map side length (assumed square).
+        rng: optional torch.Generator for reproducibility.
 
     Returns:
-        Tensor (P, H'*W') cosine similarity, dtype matches `feat`.
+        point_coords: (P, 2) long, in (row, col) feature-grid coords.
     """
-    c, h, w = feat.shape
-    flat = feat.reshape(c, h * w).t()                  # (H'W', C)
-    flat_n = flat / flat.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    idx = torch.as_tensor(
-        anchors_xy[:, 1] * w + anchors_xy[:, 0], dtype=torch.long, device=feat.device
+    res_h, res_w = merged_gt_mask.shape
+    nonzero = torch.nonzero(merged_gt_mask)                  # (M, 2) in (row, col)
+    num_gt = num_samples // 2
+    num_rand = num_samples - num_gt
+
+    if len(nonzero) >= num_gt:
+        perm = torch.randperm(len(nonzero), generator=rng)[:num_gt]
+        sampled_gt = nonzero[perm]
+    else:
+        sampled_gt = nonzero
+        num_rand += num_gt - len(nonzero)
+
+    rand_h = torch.randint(0, res_h, (num_rand,), generator=rng)
+    rand_w = torch.randint(0, res_w, (num_rand,), generator=rng)
+    rand_pix = torch.stack([rand_h, rand_w], dim=1)          # (num_rand, 2) (row, col)
+
+    pix_hw = torch.cat([sampled_gt, rand_pix], dim=0).float()
+    pix_hw[:, 0] *= feat_res / res_h
+    pix_hw[:, 1] *= feat_res / res_w
+    return pix_hw.long().clamp_(0, feat_res - 1)             # (P, 2) (row, col)
+
+
+def sample_anchors_from_mask(
+    mask: np.ndarray, feat_h: int, feat_w: int, num_anchors: int, rng_torch: torch.Generator
+) -> np.ndarray:
+    """Thin wrapper that returns (P, 2) int32 (row, col) ndarray."""
+    assert feat_h == feat_w, "S4M assumes square feature map"
+    mask_t = torch.from_numpy(mask.astype(np.uint8))
+    coords = s4m_extract_point_gt_rand(
+        merged_gt_mask=mask_t,
+        num_samples=num_anchors,
+        feat_res=feat_h,
+        rng=rng_torch,
     )
-    anchor = flat_n[idx]                                # (P, C)
-    return anchor @ flat_n.t()                          # (P, H'W')
+    return coords.numpy().astype(np.int32)
 
 
 def mask_to_polygon(mask: np.ndarray, epsilon: float) -> list[tuple[float, float]] | None:
@@ -323,7 +376,7 @@ def main() -> int:
     tracks: list[list[tuple[int, list[tuple[float, float]]]]] = [[] for _ in range(args.top_k)]
 
     score_rows: list[tuple[int, int, float]] = []  # (frame, num_dets, top_score)
-    feature_rng = np.random.default_rng(seed=0)
+    feature_rng = torch.Generator().manual_seed(0)
 
     def process_batch(start: int, frames_bgr: list[np.ndarray]) -> None:
         nonlocal writer, height, width
@@ -400,15 +453,24 @@ def main() -> int:
                     mask_for_anchors = (combined_mask > 0).astype(np.uint8)
                 else:
                     mask_for_anchors = np.zeros((height, width), dtype=np.uint8)
+                # S4M-faithful (row, col) coords in feature grid
                 anchors = sample_anchors_from_mask(
-                    mask_for_anchors, fh, fw, args.num_anchors, rng=feature_rng
+                    mask_for_anchors, fh, fw, args.num_anchors, rng_torch=feature_rng
                 )
                 with torch.inference_mode():
-                    sim_map = s4m_similarity_map(feat_l.float(), anchors)  # (P, H'W')
+                    # Match S4M's exact API: feats (N, res*res, C), coords (N, P, 2)
+                    feats_flat = (
+                        feat_l.float()
+                        .permute(1, 2, 0)
+                        .reshape(1, fh * fw, -1)
+                    )                                       # (1, H'W', C)
+                    coords_t = torch.from_numpy(anchors).to(feats_flat.device).unsqueeze(0)
+                    sim_map = s4m_calc_similarity_map(feats_flat, coords_t)[0]  # (P, H'W')
                 np.savez_compressed(
                     features_dir / f"frame_{frame_idx:06d}.npz",
                     feature=feat_l.cpu().numpy().astype(np.float16),
                     point_coords=anchors,
+                    point_coords_convention=np.array("row_col"),
                     similarity_map=sim_map.cpu().numpy().astype(np.float16),
                     top_score=np.float32(top_score),
                     feature_source=np.array(args.feature_source),
