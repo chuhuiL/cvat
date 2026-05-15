@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="approxPolyDP epsilon for mask -> polygon (default: 1.0)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Frames batched per forward pass (default: 1). Larger uses more VRAM.",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -214,40 +220,51 @@ def main() -> int:
     # SAM3 has no temporal identity, so slot index is the only association.
     tracks: list[list[tuple[int, list[tuple[float, float]]]]] = [[] for _ in range(args.top_k)]
 
-    frame_idx = 0
-    with torch.inference_mode():
-        while True:
-            ok, frame_bgr = cap.read()
-            if not ok or (args.max_frames and frame_idx >= args.max_frames):
-                break
+    score_rows: list[tuple[int, int, float]] = []  # (frame, num_dets, top_score)
 
-            if width == 0:
-                height, width = frame_bgr.shape[:2]
+    def process_batch(start: int, frames_bgr: list[np.ndarray]) -> None:
+        nonlocal writer, height, width
+        if not frames_bgr:
+            return
+        if width == 0:
+            height, width = frames_bgr[0].shape[:2]
 
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            pil = Image.fromarray(frame_rgb)
-            inputs = processor(images=pil, text=args.prompt, return_tensors="pt").to(device)
-            outputs = model(**inputs)
-            results = processor.post_process_instance_segmentation(
-                outputs,
-                threshold=args.score_threshold,
-                mask_threshold=args.mask_threshold,
-                target_sizes=inputs.get("original_sizes").tolist(),
-            )[0]
+        pils = [
+            Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_bgr
+        ]
+        inputs = processor(
+            images=pils, text=[args.prompt] * len(pils), return_tensors="pt"
+        ).to(device)
+        outputs = model(**inputs)
+        target_sizes = inputs.get("original_sizes").tolist()
+        per_image = processor.post_process_instance_segmentation(
+            outputs,
+            threshold=args.score_threshold,
+            mask_threshold=args.mask_threshold,
+            target_sizes=target_sizes,
+        )
 
+        for i, results in enumerate(per_image):
+            frame_idx = start + i
+            frame_bgr = frames_bgr[i]
             masks = results["masks"]
             scores = results["scores"]
 
-            order = torch.argsort(scores, descending=True) if len(scores) else torch.tensor([], dtype=torch.long)
+            order = (
+                torch.argsort(scores, descending=True)
+                if len(scores)
+                else torch.tensor([], dtype=torch.long)
+            )
             kept = order[: args.top_k].tolist()
 
             combined_mask = np.zeros((height, width), dtype=np.uint8)
             for slot, det_idx in enumerate(kept):
                 mask_np = masks[det_idx].detach().cpu().numpy().astype(bool)
-                # Defensive resize if SAM3 returns mask at non-original size
                 if mask_np.shape != (height, width):
                     mask_np = cv2.resize(
-                        mask_np.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST
+                        mask_np.astype(np.uint8),
+                        (width, height),
+                        interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
                 combined_mask[mask_np] = 255
 
@@ -256,6 +273,9 @@ def main() -> int:
                     tracks[slot].append((frame_idx, poly))
 
             cv2.imwrite(str(masks_dir / f"frame_{frame_idx:06d}.png"), combined_mask)
+
+            top_score = float(scores[kept[0]]) if kept else 0.0
+            score_rows.append((frame_idx, len(scores), top_score))
 
             if args.overlay:
                 if writer is None:
@@ -270,9 +290,27 @@ def main() -> int:
                 writer.write(overlay)
 
             if frame_idx % 50 == 0:
-                kept_scores = [float(scores[i]) for i in kept]
-                print(f"[sam3] frame {frame_idx}/{total}  kept={len(kept)}  scores={kept_scores}")
+                kept_scores = [float(scores[j]) for j in kept]
+                print(
+                    f"[sam3] frame {frame_idx}/{total}  kept={len(kept)}  scores={kept_scores}"
+                )
+
+    frame_idx = 0
+    pending: list[np.ndarray] = []
+    pending_start = 0
+    with torch.inference_mode():
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok or (args.max_frames and frame_idx >= args.max_frames):
+                break
+            pending.append(frame_bgr)
             frame_idx += 1
+            if len(pending) >= args.batch_size:
+                process_batch(pending_start, pending)
+                pending_start = frame_idx
+                pending = []
+        if pending:
+            process_batch(pending_start, pending)
 
     cap.release()
     if writer is not None:
@@ -288,10 +326,25 @@ def main() -> int:
     )
     (out_dir / "annotations.xml").write_text(xml, encoding="utf-8")
 
+    score_rows.sort(key=lambda r: r[0])
+    csv_lines = ["frame,num_detections,top_score"] + [
+        f"{f},{n},{s:.4f}" for f, n, s in score_rows
+    ]
+    (out_dir / "scores.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+
+    top_scores = [s for _, n, s in score_rows if n > 0]
+    no_det = sum(1 for _, n, _ in score_rows if n == 0)
+    if top_scores:
+        lo, hi = min(top_scores), max(top_scores)
+        mean = sum(top_scores) / len(top_scores)
+        low_conf = sum(1 for s in top_scores if s < 0.7)
+        print(
+            f"[sam3] confidence: min={lo:.3f}  mean={mean:.3f}  max={hi:.3f}  "
+            f"frames<0.7={low_conf}  frames_with_no_detection={no_det}"
+        )
     nonempty = sum(1 for t in tracks if t)
     print(
-        f"[sam3] done  frames={frame_idx}  tracks={nonempty}  "
-        f"out={out_dir}"
+        f"[sam3] done  frames={frame_idx}  tracks={nonempty}  out={out_dir}"
     )
     return 0
 
