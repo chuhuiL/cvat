@@ -76,14 +76,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-features",
         action="store_true",
-        help="Save vision-encoder FPN features and S4M-style similarity maps per frame",
+        help="Save SAM3 features and S4M-style similarity maps per frame",
+    )
+    parser.add_argument(
+        "--feature-source",
+        choices=["decoder", "encoder"],
+        default="decoder",
+        help=(
+            "Which features to dump. 'decoder' = mask_decoder.pixel_decoder output "
+            "(S4M-faithful, default). 'encoder' = vision_encoder FPN output."
+        ),
     )
     parser.add_argument(
         "--feature-level",
         type=int,
         default=2,
         choices=[0, 1, 2, 3],
-        help="FPN level to dump (0=288x288, 1=144x144, 2=72x72 default, 3=36x36)",
+        help="FPN level when --feature-source=encoder (0=288,1=144,2=72,3=36)",
+    )
+    parser.add_argument(
+        "--feature-resize",
+        type=int,
+        default=72,
+        help="Resize saved feature spatial dim to NxN (default 72; set 0 to keep native size)",
     )
     parser.add_argument(
         "--num-anchors",
@@ -283,7 +298,13 @@ def main() -> int:
         def _capture_vision(_m, _inp, out):
             feat_cache["fpn"] = out.fpn_hidden_states
 
-        model.vision_encoder.register_forward_hook(_capture_vision)
+        def _capture_pixel_decoder(_m, _inp, out):
+            feat_cache["pixel_decoder"] = out
+
+        if args.feature_source == "encoder":
+            model.vision_encoder.register_forward_hook(_capture_vision)
+        else:
+            model.mask_decoder.pixel_decoder.register_forward_hook(_capture_pixel_decoder)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -359,9 +380,21 @@ def main() -> int:
             top_score = float(scores[kept[0]]) if kept else 0.0
             score_rows.append((frame_idx, len(scores), top_score))
 
-            if args.save_features and "fpn" in feat_cache:
-                # Per-frame slice of FPN level L from the batched hook capture
-                feat_l = feat_cache["fpn"][args.feature_level][i]  # (C, H', W')
+            if args.save_features and (
+                ("fpn" in feat_cache) or ("pixel_decoder" in feat_cache)
+            ):
+                if args.feature_source == "encoder":
+                    feat_l = feat_cache["fpn"][args.feature_level][i]  # (C, H', W')
+                else:
+                    feat_l = feat_cache["pixel_decoder"][i]            # (C, 288, 288)
+
+                if args.feature_resize > 0 and feat_l.shape[-1] != args.feature_resize:
+                    feat_l = torch.nn.functional.interpolate(
+                        feat_l.unsqueeze(0),
+                        size=(args.feature_resize, args.feature_resize),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0]
                 fh, fw = feat_l.shape[-2:]
                 if kept:
                     mask_for_anchors = (combined_mask > 0).astype(np.uint8)
@@ -374,11 +407,14 @@ def main() -> int:
                     sim_map = s4m_similarity_map(feat_l.float(), anchors)  # (P, H'W')
                 np.savez_compressed(
                     features_dir / f"frame_{frame_idx:06d}.npz",
-                    vision_feat=feat_l.cpu().numpy().astype(np.float16),
+                    feature=feat_l.cpu().numpy().astype(np.float16),
                     point_coords=anchors,
                     similarity_map=sim_map.cpu().numpy().astype(np.float16),
                     top_score=np.float32(top_score),
-                    fpn_level=np.int32(args.feature_level),
+                    feature_source=np.array(args.feature_source),
+                    fpn_level=np.int32(
+                        args.feature_level if args.feature_source == "encoder" else -1
+                    ),
                     feat_hw=np.int32([fh, fw]),
                     image_hw=np.int32([height, width]),
                 )
